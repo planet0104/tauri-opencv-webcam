@@ -1,13 +1,15 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{num::NonZeroU32, sync::Mutex};
+use std::{num::NonZeroU32, sync::Mutex, path::PathBuf, fs};
 use anyhow::{Result, anyhow};
+use image::RgbImage;
 use minifb::{Window, WindowOptions, Key, ScaleMode};
 use nokhwa::{utils::{CameraIndex, RequestedFormat, RequestedFormatType}, pixel_format::RgbFormat, Camera};
 use once_cell::sync::Lazy;
 // use opencv::{prelude::*, imgcodecs::imwrite, core::{Vector, CV_8UC3}};
 use tauri::Manager;
+use time::{format_description, OffsetDateTime};
 use windows::Win32::{UI::WindowsAndMessaging::{SetWindowPos, SWP_SHOWWINDOW}, Foundation::HWND};
 
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
@@ -22,7 +24,7 @@ fn main() {
             let _main_window = app.get_window("main").unwrap();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet, open_camera, close_camera, update_window_position])
+        .invoke_handler(tauri::generate_handler![greet, open_camera, close_camera, update_window_position, take_picture])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -55,6 +57,30 @@ async fn close_camera() -> std::result::Result<(), String>{
     Ok(())
 }
 
+#[tauri::command]
+fn take_picture() -> std::result::Result<String, String>{
+    println!("rust进入take_picture...");
+    let mut c = CAMERA_INSTANCE.lock().map_err(|err| format!("相机锁定失败:{:?}", err))?;
+    if c.is_none(){
+        return Err(format!("相机未打开!"));
+    }
+    let camera = c.as_mut().unwrap();
+    let frame = camera.frame().map_err(|err| format!("相机拍照失败:{:?}", err))?;
+    let decoded_frame = frame.decode_image::<RgbFormat>().map_err(|err| format!("图像解码失败:{:?}", err))?;
+    println!("拍照图片大小:{}x{}", decoded_frame.width(), decoded_frame.height());
+    //文件名
+    let local = OffsetDateTime::now_local().map_err(|err| format!("日期获取失败:{:?}", err))?;
+    let format = format_description::parse("[year][month][day][hour][minute][second][subsecond]",).map_err(|err| format!("日期格式化失败:{:?}", err))?;
+    let file_name = local.format(&format).map_err(|err| format!("日期格式化失败:{:?}", err))?;
+    let file_name = format!("../{}.jpg", file_name);
+    println!("拍照图片文件名:{file_name}");
+    let img = RgbImage::from_raw(decoded_frame.width(), decoded_frame.height(), decoded_frame.to_vec()).unwrap();
+    img.save(&file_name).map_err(|err| format!("图片保存失败:{:?}", err))?;
+    let path_buf = PathBuf::from(file_name);
+    Ok(fs::canonicalize(&path_buf).map_err(|err| format!("图片保存失败:{:?}", err))?.to_str().unwrap().to_string())
+}
+
+static CAMERA_INSTANCE: Lazy<Mutex<Option<Camera>>> = Lazy::new(|| { Mutex::new(None) });
 static CAMERA_OPENED: Lazy<Mutex<bool>> = Lazy::new(|| { Mutex::new(false) });
 static CAMERA_WINDOW_POSITION: Lazy<Mutex<(isize, isize, usize, usize)>> = Lazy::new(|| { Mutex::new((0, 0, 0, 0)) });
 
@@ -83,7 +109,7 @@ fn start_camera(camera_index: u32, width_percent: f32, height_percent: f32, offs
     let index = CameraIndex::Index(camera_index); 
     let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
     
-    let mut camera = Camera::new(index, requested)?;
+    CAMERA_INSTANCE.lock().map_err(|err| anyhow!("{:?}", err))?.replace(Camera::new(index, requested)?);
 
     let (mut window_x, mut window_y, mut window_width, mut window_height) = get_camera_window_rect()?;
 
@@ -154,48 +180,56 @@ fn start_camera(camera_index: u32, width_percent: f32, height_percent: f32, offs
             }
         }
 
-        // let t = Instant::now();
-        let frame = camera.frame()?;
-        // decode into an ImageBuffer
-        let mut decoded_frame = frame.decode_image::<RgbFormat>()?;
+        if let Ok(mut camera) = CAMERA_INSTANCE.try_lock(){
+            // let t = Instant::now();
+            if camera.is_none(){
+                println!("相机为空, 结束窗口循环");
+                break;
+            }
+            let camera = camera.as_mut().unwrap();
 
-        // let t = Instant::now();
+            let frame = camera.frame()?;
+            // decode into an ImageBuffer
+            let mut decoded_frame = frame.decode_image::<RgbFormat>()?;
 
-        let width = NonZeroU32::new(decoded_frame.width()).unwrap();
-        let height = NonZeroU32::new(decoded_frame.height()).unwrap();
-        let src_image = fast_image_resize::Image::from_slice_u8(
-            width,
-            height,
-            &mut decoded_frame,
-            fast_image_resize::PixelType::U8x3,
-        )?;
+            // let t = Instant::now();
 
-        // Create container for data of destination image
-        let dst_width = NonZeroU32::new(calc_pos.2 as u32).unwrap();
-        let dst_height = NonZeroU32::new(calc_pos.3 as u32).unwrap();
-        let mut dst_image = fast_image_resize::Image::new(
-            dst_width,
-            dst_height,
-            src_image.pixel_type(),
-        );
+            let width = NonZeroU32::new(decoded_frame.width()).unwrap();
+            let height = NonZeroU32::new(decoded_frame.height()).unwrap();
+            let src_image = fast_image_resize::Image::from_slice_u8(
+                width,
+                height,
+                &mut decoded_frame,
+                fast_image_resize::PixelType::U8x3,
+            )?;
 
-        // Get mutable view of destination image data
-        let mut dst_view = dst_image.view_mut();
+            // Create container for data of destination image
+            let dst_width = NonZeroU32::new(calc_pos.2 as u32).unwrap();
+            let dst_height = NonZeroU32::new(calc_pos.3 as u32).unwrap();
+            let mut dst_image = fast_image_resize::Image::new(
+                dst_width,
+                dst_height,
+                src_image.pixel_type(),
+            );
 
-        // Create Resizer instance and resize source image
-        // into buffer of destination image
-        let mut resizer = fast_image_resize::Resizer::new(
-            fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Bilinear),
-        );
-        resizer.resize(&src_image.view(), &mut dst_view)?;
-        
-        for (pixel, target) in dst_image.buffer().chunks(3).zip(buffer.iter_mut()){
-            *target = u32::from_be_bytes([0, pixel[0], pixel[1], pixel[2]]);
+            // Get mutable view of destination image data
+            let mut dst_view = dst_image.view_mut();
+
+            // Create Resizer instance and resize source image
+            // into buffer of destination image
+            let mut resizer = fast_image_resize::Resizer::new(
+                fast_image_resize::ResizeAlg::Convolution(fast_image_resize::FilterType::Bilinear),
+            );
+            resizer.resize(&src_image.view(), &mut dst_view)?;
+
+            for (pixel, target) in dst_image.buffer().chunks(3).zip(buffer.iter_mut()){
+                *target = u32::from_be_bytes([0, pixel[0], pixel[1], pixel[2]]);
+            }
+
+            // println!("耗时:{}ms", t.elapsed().as_millis());
+
+            // decoded = Some(decoded_frame);
         }
-        
-        // println!("耗时:{}ms", t.elapsed().as_millis());
-
-        // decoded = Some(decoded_frame);
         
         window.update_with_buffer(&buffer, calc_pos.2, calc_pos.3)?;
     }

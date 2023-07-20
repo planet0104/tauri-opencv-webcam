@@ -40,6 +40,15 @@ async function closeCamera() {
   console.log('js执行closeCamera OK.', r);
 }
 
+async function takePicture() {
+  console.log('js执行takePicture...');
+  let path:String = await invoke("take_picture");
+  if(path.startsWith('\\\\?\\')){
+    path = path.replace('\\\\?\\', '');
+  }
+  console.log('js执行takePicture OK:', path);
+}
+
 </script>
 
 <template>
@@ -50,5 +59,9 @@ async function closeCamera() {
 
   <p>{{ greetMsg }}</p>
 
-  <div><button @click="openCamera()">打开相机</button><button @click="closeCamera()">关闭相机</button></div>
+  <div>
+    <button @click="openCamera()">打开相机</button>
+    <button @click="closeCamera()">关闭相机</button>
+    <button @click="takePicture()">拍照</button>
+  </div>
 </template>
